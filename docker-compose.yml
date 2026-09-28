@@ -1,0 +1,80 @@
+# =====================================================
+# AI PR Review Agent — Local Development
+# =====================================================
+# Services: FastAPI API + arq Worker + Postgres + Redis
+# Usage:
+#   docker-compose up -d          # Start all services
+#   docker-compose logs -f api    # Follow API logs
+#   docker-compose down -v        # Stop + remove volumes
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pr_review
+      POSTGRES_PASSWORD: pr_review
+      POSTGRES_DB: pr_review
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pr_review"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      - DATABASE_URL=postgresql://pr_review:pr_review@postgres:5432/pr_review
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # --- arq worker (processes review jobs) ---
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: arq src.queue.worker.WorkerSettings
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      - DATABASE_URL=postgresql://pr_review:pr_review@postgres:5432/pr_review
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
