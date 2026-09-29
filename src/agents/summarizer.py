@@ -10,26 +10,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 import structlog
 
 from src.llm.fallback import QuotaAwareFallbackLLM
-from src.models.schemas import DiffContext, Finding
+from src.models.schemas import DiffContext, Finding, SummaryOutput
 
 logger = structlog.get_logger()
 
 # Load prompt from versioned file
 PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "v1" / "summarizer.md"
-
-# JSON Schema for structured output
-SUMMARY_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string"},
-    },
-    "required": ["summary"],
-}
 
 
 def _load_system_prompt() -> str:
@@ -52,16 +42,7 @@ def _build_findings_content(
     Includes findings as JSON + diff stats for context.
     """
     findings_json = [
-        {
-            "file": f.file,
-            "line": f.line,
-            "severity": f.severity,
-            "category": f.category,
-            "message": f.message,
-            "suggested_fix": f.suggested_fix,
-            "confidence": f.confidence,
-            "agent": f.agent,
-        }
+        f.model_dump(include={"file", "line", "severity", "category", "message", "suggested_fix", "confidence", "agent"})
         for f in findings
     ]
 
@@ -174,7 +155,7 @@ async def run_summarizer(
 
     response = await llm.invoke(
         messages=messages,
-        response_schema=SUMMARY_SCHEMA,
+        response_schema=SummaryOutput,
         temperature=0.4,
         max_tokens=1500,
         timeout=timeout,
@@ -184,28 +165,28 @@ async def run_summarizer(
         logger.warning("summarizer.all_providers_failed_using_fallback")
         return _generate_fallback_summary(findings, diff_context)
 
-    # Parse the response
+    # Parse the response via Pydantic
     try:
-        data = json.loads(response.content)
-        summary = data.get("summary", "")
-        if summary:
+        result = SummaryOutput.model_validate_json(response.content)
+        if result.summary:
             logger.info(
                 "summarizer.completed",
                 model=response.model,
                 provider=response.provider,
                 tokens=response.tokens_used,
-                summary_length=len(summary),
+                summary_length=len(result.summary),
             )
-            return summary
+            return result.summary
         else:
             logger.warning("summarizer.empty_summary")
             return _generate_fallback_summary(findings, diff_context)
 
-    except (json.JSONDecodeError, KeyError) as e:
-        # If JSON parsing fails, the raw content might be a valid markdown string
+    except Exception as e:
+        # If Pydantic parsing fails, the raw content might be valid markdown
         if response.content and len(response.content) > 50:
             logger.info("summarizer.using_raw_content")
             return response.content
 
         logger.warning("summarizer.parse_error", error=str(e))
         return _generate_fallback_summary(findings, diff_context)
+

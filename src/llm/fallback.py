@@ -19,15 +19,12 @@ from typing import Any
 
 import structlog
 
+from pydantic import BaseModel
+
 from src.llm.providers import LLMProvider, LLMResponse
 from src.llm.quota import ProviderQuotaTracker
 
 logger = structlog.get_logger()
-
-
-# ---------------------------------------------------------------------------
-# Error types for classification
-# ---------------------------------------------------------------------------
 
 class RateLimitError(Exception):
     """Provider returned 429 — rate limited."""
@@ -116,7 +113,7 @@ class QuotaAwareFallbackLLM:
     async def invoke(
         self,
         messages: list[dict[str, str]],
-        response_schema: dict[str, Any] | None = None,
+        response_schema: type[BaseModel] | dict[str, Any] | None = None,
         temperature: float = 0.2,
         max_tokens: int = 2000,
         timeout: int = 30,

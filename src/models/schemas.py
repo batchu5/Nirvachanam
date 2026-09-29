@@ -132,9 +132,19 @@ class PRMetadata(BaseModel):
     base_sha: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Token tracking (per-agent)
-# ---------------------------------------------------------------------------
+class BugAgentOutput(BaseModel):
+    """Structured output from the bug detection agent.
+
+    The LLM returns this shape; we validate with model_validate_json()
+    instead of manual json.loads() + dict wrangling.
+    """
+    findings: list[Finding] = Field(default_factory=list)
+
+
+class SummaryOutput(BaseModel):
+    """Structured output from the summarizer agent."""
+    summary: str
+
 
 class TokenUsage(BaseModel):
     """Per-agent token consumption — tracked for quota management."""
@@ -143,10 +153,6 @@ class TokenUsage(BaseModel):
     model: str = ""
     provider: str = ""
 
-
-# ---------------------------------------------------------------------------
-# §2 — ReviewState (LangGraph state schema)
-# ---------------------------------------------------------------------------
 
 class ReviewState(TypedDict, total=False):
     """LangGraph graph state.
@@ -167,10 +173,6 @@ class ReviewState(TypedDict, total=False):
     model_usage: dict[str, TokenUsage]
     pr_metadata: PRMetadata
 
-
-# ---------------------------------------------------------------------------
-# Webhook payload (partial — only the fields we need)
-# ---------------------------------------------------------------------------
 
 class WebhookPullRequestPayload(BaseModel):
     """Partial model for GitHub `pull_request` webhook event.

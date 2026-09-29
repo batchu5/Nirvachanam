@@ -8,61 +8,23 @@ References: PRD §1b (model allocation), §2 (agent orchestration), §3 (Finding
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any
 
 import structlog
 from pydantic import ValidationError
 
 from src.llm.fallback import QuotaAwareFallbackLLM
-from src.models.enums import Category, Severity
-from src.models.schemas import DiffContext, Finding
+from src.models.schemas import BugAgentOutput, DiffContext, Finding
 
 logger = structlog.get_logger()
 
 # Load prompt from versioned file
 PROMPT_PATH = Path(__file__).parent.parent.parent / "prompts" / "v1" / "bug_agent.md"
 
-# JSON Schema for structured output — matches Finding model
-FINDING_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "findings": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "file": {"type": "string"},
-                    "line": {"type": "integer"},
-                    "end_line": {"type": "integer"},
-                    "severity": {"type": "string", "enum": ["info", "warning", "critical"]},
-                    "category": {"type": "string", "enum": ["bug"]},
-                    "message": {"type": "string"},
-                    "suggested_fix": {"type": "string"},
-                    "confidence": {"type": "number"},
-                    "agent": {"type": "string", "enum": ["bug_agent"]},
-                    "language": {"type": "string"},
-                },
-                "required": ["file", "line", "severity", "category", "message", "agent"],
-            },
-        }
-    },
-    "required": ["findings"],
-}
-
 
 def _load_system_prompt() -> str:
     """Load the bug agent system prompt from the versioned prompt file."""
-    if PROMPT_PATH.exists():
-        return PROMPT_PATH.read_text(encoding="utf-8")
-    # Fallback inline prompt if file not found
-    logger.warning("bug_agent.prompt_file_missing", path=str(PROMPT_PATH))
-    return (
-        "You are a code review bug detection agent. Analyze the diff and return "
-        "a JSON object with a 'findings' array of bugs found. Each finding must have: "
-        "file, line, severity (info/warning/critical), category (bug), message, agent (bug_agent)."
-    )
+    return PROMPT_PATH.read_text(encoding="utf-8")
 
 
 def _build_diff_content(diff_context: DiffContext) -> str:
@@ -82,8 +44,8 @@ def _build_diff_content(diff_context: DiffContext) -> str:
     return "\n".join(parts)
 
 
-def _parse_findings(raw_content: str) -> list[Finding]:
-    """Parse LLM response into validated Finding objects.
+def _parse_response(raw_content: str) -> list[Finding]:
+    """Parse and validate LLM response using Pydantic.
 
     Args:
         raw_content: JSON string from LLM response.
@@ -92,31 +54,10 @@ def _parse_findings(raw_content: str) -> list[Finding]:
         List of validated Finding objects.
 
     Raises:
-        ValueError: If JSON parsing fails.
         ValidationError: If pydantic validation fails.
     """
-    data = json.loads(raw_content)
-    findings_data = data.get("findings", [])
-
-    findings: list[Finding] = []
-    for item in findings_data:
-        # Ensure required defaults
-        item.setdefault("category", "bug")
-        item.setdefault("agent", "bug_agent")
-        item.setdefault("confidence", 0.5)
-
-        try:
-            finding = Finding(**item)
-            findings.append(finding)
-        except ValidationError as e:
-            logger.warning(
-                "bug_agent.finding_validation_error",
-                error=str(e),
-                raw=item,
-            )
-            # Skip invalid findings rather than crash
-
-    return findings
+    output = BugAgentOutput.model_validate_json(raw_content)
+    return output.findings
 
 
 async def run_bug_agent(
@@ -150,7 +91,7 @@ async def run_bug_agent(
     # First attempt
     response = await llm.invoke(
         messages=messages,
-        response_schema=FINDING_SCHEMA,
+        response_schema=BugAgentOutput,
         temperature=0.2,
         max_tokens=2000,
         timeout=timeout,
@@ -160,9 +101,9 @@ async def run_bug_agent(
         logger.warning("bug_agent.all_providers_failed")
         return []
 
-    # Parse and validate
+    # Parse and validate via Pydantic
     try:
-        findings = _parse_findings(response.content)
+        findings = _parse_response(response.content)
         logger.info(
             "bug_agent.completed",
             findings=len(findings),
@@ -172,7 +113,7 @@ async def run_bug_agent(
         )
         return findings
 
-    except (json.JSONDecodeError, ValueError) as e:
+    except ValidationError as e:
         # Repair retry: inject error into prompt and try again
         logger.warning("bug_agent.parse_error_retrying", error=str(e))
 
@@ -184,7 +125,7 @@ async def run_bug_agent(
             {
                 "role": "user",
                 "content": (
-                    f"Your previous response was not valid JSON. Error: {e}\n"
+                    f"Your previous response failed validation. Error: {e}\n"
                     "Please try again with valid JSON matching the schema."
                 ),
             },
@@ -192,7 +133,7 @@ async def run_bug_agent(
 
         retry_response = await llm.invoke(
             messages=repair_messages,
-            response_schema=FINDING_SCHEMA,
+            response_schema=BugAgentOutput,
             temperature=0.1,
             max_tokens=2000,
             timeout=timeout,
@@ -203,7 +144,7 @@ async def run_bug_agent(
             return []
 
         try:
-            findings = _parse_findings(retry_response.content)
+            findings = _parse_response(retry_response.content)
             logger.info(
                 "bug_agent.completed_after_repair",
                 findings=len(findings),
@@ -214,6 +155,3 @@ async def run_bug_agent(
             logger.error("bug_agent.repair_failed", error=str(e2))
             return []
 
-    except ValidationError as e:
-        logger.error("bug_agent.validation_error", error=str(e))
-        return []

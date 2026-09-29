@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from src.agents.bug_agent import run_bug_agent, _parse_findings, _build_diff_content
+from src.agents.bug_agent import run_bug_agent, _parse_response, _build_diff_content
 from src.llm.providers import LLMResponse
 from src.models.schemas import DiffContext, FileContext, HunkInfo
 
@@ -121,8 +121,8 @@ def make_llm(mock_bug_response):
 # Tests
 # ---------------------------------------------------------------------------
 
-class TestParseFinding:
-    """Tests for _parse_findings."""
+class TestParseResponse:
+    """Tests for _parse_response (Pydantic-based parsing)."""
 
     def test_parse_valid_findings(self):
         raw = json.dumps({
@@ -137,7 +137,7 @@ class TestParseFinding:
                 }
             ]
         })
-        findings = _parse_findings(raw)
+        findings = _parse_response(raw)
         assert len(findings) == 1
         assert findings[0].file == "test.py"
         assert findings[0].severity == "warning"
@@ -145,33 +145,32 @@ class TestParseFinding:
 
     def test_parse_empty_findings(self):
         raw = json.dumps({"findings": []})
-        findings = _parse_findings(raw)
+        findings = _parse_response(raw)
         assert findings == []
 
-    def test_parse_invalid_finding_skipped(self):
-        """Invalid individual findings should be skipped, not crash."""
+    def test_parse_invalid_finding_raises(self):
+        """Invalid findings now raise ValidationError (triggers repair retry)."""
+        from pydantic import ValidationError
         raw = json.dumps({
             "findings": [
-                {"file": "test.py", "line": 10, "severity": "warning",
-                 "category": "bug", "message": "valid", "agent": "bug_agent"},
                 {"file": "test.py"},  # Missing required fields
             ]
         })
-        findings = _parse_findings(raw)
-        assert len(findings) == 1  # Only the valid one
+        with pytest.raises(ValidationError):
+            _parse_response(raw)
 
-    def test_parse_sets_defaults(self):
+    def test_parse_uses_model_defaults(self):
+        """Pydantic model defaults are applied automatically."""
         raw = json.dumps({
             "findings": [
                 {"file": "test.py", "line": 5, "severity": "info",
-                 "message": "note", "language": "python"}
+                 "category": "bug", "message": "note", "agent": "bug_agent",
+                 "language": "python"}
             ]
         })
-        findings = _parse_findings(raw)
+        findings = _parse_response(raw)
         assert len(findings) == 1
-        assert findings[0].category == "bug"  # Default
-        assert findings[0].agent == "bug_agent"  # Default
-        assert findings[0].confidence == 0.5  # Default
+        assert findings[0].confidence == 0.5  # Default from Finding model
 
 
 class TestBuildDiffContent:

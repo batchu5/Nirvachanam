@@ -5,6 +5,9 @@ Providers handle structured output differently:
   - Gemini: native `response_schema` + `response_mime_type: "application/json"`
   - Groq: OpenAI-compatible function/tool calling
 
+Both providers accept a Pydantic BaseModel subclass as `response_schema`;
+the JSON schema is derived automatically via `model_json_schema()`.
+
 References: PRD §1b (model allocation), §3 (structured output).
 """
 
@@ -13,7 +16,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from typing import Any, Protocol
-
+from groq import AsyncGroq
+from pydantic import BaseModel
+from google import genai
 import structlog
 
 logger = structlog.get_logger()
@@ -35,6 +40,19 @@ class LLMResponse:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_schema(schema: type[BaseModel] | dict[str, Any] | None) -> dict[str, Any] | None:
+    """Convert a Pydantic model class to a JSON Schema dict, or pass through."""
+    if schema is None:
+        return None
+    if isinstance(schema, type) and issubclass(schema, BaseModel):
+        return schema.model_json_schema()
+    return schema  # already a dict
+
+
+# ---------------------------------------------------------------------------
 # Provider protocol
 # ---------------------------------------------------------------------------
 
@@ -47,7 +65,7 @@ class LLMProvider(Protocol):
     async def invoke(
         self,
         messages: list[dict[str, str]],
-        response_schema: dict[str, Any] | None = None,
+        response_schema: type[BaseModel] | dict[str, Any] | None = None,
         temperature: float = 0.2,
         max_tokens: int = 2000,
     ) -> LLMResponse: ...
@@ -64,8 +82,6 @@ class GeminiProvider:
     """
 
     def __init__(self, api_key: str, model: str = "gemini-2.5-flash"):
-        from google import genai
-
         self._client = genai.Client(api_key=api_key)
         self._model = model
 
@@ -76,7 +92,7 @@ class GeminiProvider:
     async def invoke(
         self,
         messages: list[dict[str, str]],
-        response_schema: dict[str, Any] | None = None,
+        response_schema: type[BaseModel] | dict[str, Any] | None = None,
         temperature: float = 0.2,
         max_tokens: int = 2000,
     ) -> LLMResponse:
@@ -93,15 +109,18 @@ class GeminiProvider:
         """
         from google.genai import types
 
+        # Resolve Pydantic model → JSON Schema dict if needed
+        resolved_schema = _resolve_schema(response_schema)
+
         # Build config
         config_kwargs: dict[str, Any] = {
             "temperature": temperature,
             "max_output_tokens": max_tokens,
         }
 
-        if response_schema is not None:
+        if resolved_schema is not None:
             config_kwargs["response_mime_type"] = "application/json"
-            config_kwargs["response_schema"] = response_schema
+            config_kwargs["response_schema"] = resolved_schema
 
         config = types.GenerateContentConfig(**config_kwargs)
 
@@ -157,10 +176,6 @@ class GeminiProvider:
         )
 
 
-# ---------------------------------------------------------------------------
-# Groq Provider (official groq SDK — OpenAI-compatible)
-# ---------------------------------------------------------------------------
-
 class GroqProvider:
     """Groq provider using the official groq SDK.
 
@@ -168,7 +183,7 @@ class GroqProvider:
     """
 
     def __init__(self, api_key: str, model: str = "llama-3.3-70b-versatile"):
-        from groq import AsyncGroq
+        
 
         self._client = AsyncGroq(api_key=api_key)
         self._model = model
@@ -180,7 +195,7 @@ class GroqProvider:
     async def invoke(
         self,
         messages: list[dict[str, str]],
-        response_schema: dict[str, Any] | None = None,
+        response_schema: type[BaseModel] | dict[str, Any] | None = None,
         temperature: float = 0.2,
         max_tokens: int = 2000,
     ) -> LLMResponse:
@@ -196,6 +211,9 @@ class GroqProvider:
         Returns:
             LLMResponse with content.
         """
+        # Resolve Pydantic model → JSON Schema dict if needed
+        resolved_schema = _resolve_schema(response_schema)
+
         # Build kwargs
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -205,12 +223,12 @@ class GroqProvider:
         }
 
         # Groq supports JSON mode — inject schema into system prompt
-        if response_schema is not None:
+        if resolved_schema is not None:
             kwargs["response_format"] = {"type": "json_object"}
             # Prepend schema instruction to system message
             schema_instruction = (
                 f"\n\nYou MUST respond with valid JSON matching this schema:\n"
-                f"```json\n{json.dumps(response_schema, indent=2)}\n```"
+                f"```json\n{json.dumps(resolved_schema, indent=2)}\n```"
             )
             messages = list(messages)  # Don't mutate caller's list
             if messages and messages[0]["role"] == "system":
