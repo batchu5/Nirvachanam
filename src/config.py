@@ -37,10 +37,19 @@ class Settings(BaseSettings):
         description="Postgres connection string",
     )
 
+    # --- LLM Providers ---
+    gemini_api_key: str = Field(default="", description="Google Gemini AI Studio API key")
+    gemini_model: str = Field(default="gemini-2.5-flash", description="Gemini model name")
+    groq_api_key: str = Field(default="", description="Groq API key")
+    groq_model: str = Field(default="llama-3.3-70b-versatile", description="Groq model name")
+
     # --- App ---
     review_debounce_seconds: int = Field(
         default=60, description="Debounce window before triggering review (seconds)"
     )
+    max_pr_files: int = Field(default=200, description="Maximum files to review in a PR")
+    max_comments_per_review: int = Field(default=25, description="Max inline comments per review")
+    agent_timeout: int = Field(default=30, description="Hard timeout per agent call (seconds)")
     log_level: str = Field(default="INFO", description="Logging level")
     environment: str = Field(default="development", description="Runtime environment")
 
