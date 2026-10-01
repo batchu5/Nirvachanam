@@ -161,6 +161,7 @@ class ReviewState(TypedDict, total=False):
     `findings` uses Annotated[..., operator.add] for fan-in merging.
     """
     diff_context: DiffContext
+    file_decisions: list     # list[FileDecision] — set by file_selection node
     active_agents: list[str]
     findings: Annotated[list[Finding], operator.add]
     verified_findings: list[Finding]
@@ -172,6 +173,8 @@ class ReviewState(TypedDict, total=False):
     critic_available: bool
     model_usage: dict[str, TokenUsage]
     pr_metadata: PRMetadata
+    review_tier: str        # "fast", "standard", or "deep" — set by triage
+    triage_reason: str      # Human-readable reason for the tier assignment
 
 
 class WebhookPullRequestPayload(BaseModel):
