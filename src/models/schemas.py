@@ -175,6 +175,8 @@ class ReviewState(TypedDict, total=False):
     pr_metadata: PRMetadata
     review_tier: str        # "fast", "standard", or "deep" — set by triage
     triage_reason: str      # Human-readable reason for the tier assignment
+    file_groups: list       # list[FileGroup] — set by semantic_grouping node (Phase 5)
+    review_estimate: dict   # ReviewEstimate as dict — set by budget_estimation node (Phase 6)
 
 
 class WebhookPullRequestPayload(BaseModel):
