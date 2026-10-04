@@ -1,16 +1,21 @@
 """Graph node functions — bridge between LangGraph state and agent implementations.
 
-OPTIMIZED PIPELINE (Strategy 1 + 2 + Phase 1):
+FULL OCR-STYLE PIPELINE (Phase 1 + 2 + 3 + 5 + 6):
   - File Selection node (deterministic — pure function, zero LLM tokens)
   - Triage node (zero LLM tokens — pure rules on pre-filtered decisions)
-  - Reviewer node (SINGLE LLM call — replaces 4 specialist agents)
+  - Rule Grouping node (deterministic — groups files by language rules)
+  - Semantic Grouping node (Phase 5 — LLM or deterministic file grouping)
+  - Budget Estimation node (Phase 6 — pre-run cost projection, zero LLM tokens)
+  - Agent Review node (agentic tool-use loop per rule group)
   - Critic node (rule-based only — no LLM)
   - Summarizer node (template-based — no LLM)
 
-Total LLM calls: 1 (down from 6-7 in the original pipeline).
+For FAST tier PRs, the old one-shot reviewer is used instead of the
+agentic loop for speed. For STANDARD/DEEP, the agent loop runs with
+language-specific rules and tool access.
 
 References: Token optimization §1 (single-pass), §2 (tiered review),
-            new_architecture.md Phase 1 (file selection layer).
+            new_architecture.md Phase 1-6.
 """
 
 from __future__ import annotations
@@ -19,6 +24,12 @@ import asyncio
 
 import structlog
 
+from src.agents.agent_loop import review_group
+from src.agents.budget import (
+    estimate_review_cost,
+    format_estimate_banner,
+    check_budget,
+)
 from src.agents.critic import apply_rule_based_critic
 from src.agents.file_selection import (
     ExcludeReason,
@@ -28,10 +39,17 @@ from src.agents.file_selection import (
     format_selection_preview,
     total_selected_tokens,
 )
+from src.agents.grouping import (
+    FileGroup,
+    group_files,
+    format_grouping_summary,
+    total_group_tokens,
+)
 from src.agents.reviewer import run_reviewer
 from src.agents.triage import ReviewTier, triage_from_decisions, triage_pr
 from src.llm.fallback import QuotaAwareFallbackLLM
 from src.models.schemas import DiffContext, Finding, ReviewState, TokenUsage
+from src.rules.engine import group_by_rules, format_rules_summary, RuleGroup
 
 logger = structlog.get_logger()
 
@@ -140,20 +158,314 @@ async def triage_node(
 
 
 # ---------------------------------------------------------------------------
-# Unified reviewer node (SINGLE LLM call)
+# Rule Grouping node (Phase 2 — deterministic, ZERO LLM tokens)
+# ---------------------------------------------------------------------------
+
+async def rule_grouping_node(
+    state: ReviewState,
+    llm: QuotaAwareFallbackLLM,
+) -> dict:
+    """Rule grouping node — groups files by language-specific review rules.
+
+    This is Phase 2 of the OCR migration. It groups selected files by
+    which review rules apply to them, so that files sharing the same
+    language-specific rules are reviewed together.
+
+    The rule groups are stored in state for the agent_review_node to iterate.
+    For FAST tier, this node is a no-op (the old one-shot reviewer handles it).
+
+    ZERO LLM tokens — pure deterministic grouping.
+    """
+    file_decisions = state.get("file_decisions", [])
+    tier_str = state.get("review_tier", "standard")
+
+    # For FAST tier, skip grouping — the one-shot reviewer handles it
+    if tier_str == ReviewTier.FAST:
+        logger.info("node.rule_grouping.skipped_fast_tier")
+        return {"rule_groups": []}
+
+    # Get project rules from PR metadata if available
+    # TODO: Load .reviewrules.yaml from the repository
+    project_rules = None
+
+    # Group files by rules
+    rule_groups = group_by_rules(file_decisions, project_rules)
+
+    logger.info(
+        "node.rule_grouping.completed",
+        total_groups=len(rule_groups),
+        tier=tier_str,
+        summary=format_rules_summary(rule_groups),
+    )
+
+    return {"rule_groups": rule_groups}
+
+
+# ---------------------------------------------------------------------------
+# Semantic Grouping node (Phase 5 — LLM or deterministic file grouping)
+# ---------------------------------------------------------------------------
+
+async def semantic_grouping_node(
+    state: ReviewState,
+    llm: QuotaAwareFallbackLLM,
+) -> dict:
+    """Semantic grouping node — groups related files for batch review.
+
+    This is Phase 5 of the OCR migration. For small PRs, all files go
+    in one group (no LLM needed). For larger PRs, an LLM call groups
+    files by semantic relationship using ONLY file metadata (paths,
+    languages) — no diff content is sent.
+
+    The groups are stored in state as `file_groups` for the agent review
+    node to iterate over. If rule_groups already exist from Phase 2,
+    they take priority and semantic grouping is skipped.
+
+    For FAST tier, this node is a no-op.
+    """
+    file_decisions = state.get("file_decisions", [])
+    tier_str = state.get("review_tier", "standard")
+    rule_groups = state.get("rule_groups", [])
+
+    # For FAST tier, skip grouping
+    if tier_str == ReviewTier.FAST:
+        logger.info("node.semantic_grouping.skipped_fast_tier")
+        return {"file_groups": []}
+
+    # If rule groups already exist and have files, skip semantic grouping
+    # (Phase 2 rule grouping takes priority when available)
+    if rule_groups and any(g.files for g in rule_groups):
+        logger.info(
+            "node.semantic_grouping.skipped_rule_groups_exist",
+            rule_group_count=len(rule_groups),
+        )
+        return {"file_groups": []}
+
+    # Run semantic file grouping
+    file_groups = await group_files(
+        file_decisions,
+        llm=llm,
+    )
+
+    logger.info(
+        "node.semantic_grouping.completed",
+        total_groups=len(file_groups),
+        total_files=sum(len(g.files) for g in file_groups),
+        total_tokens=total_group_tokens(file_groups),
+        tier=tier_str,
+        summary=format_grouping_summary(file_groups),
+    )
+
+    return {"file_groups": file_groups}
+
+
+# ---------------------------------------------------------------------------
+# Budget Estimation node (Phase 6 — pre-run cost projection)
+# ---------------------------------------------------------------------------
+
+async def budget_estimation_node(
+    state: ReviewState,
+    llm: QuotaAwareFallbackLLM,
+) -> dict:
+    """Budget estimation node — pre-run cost projection.
+
+    This is Phase 6 of the OCR migration. Before any review LLM calls,
+    estimate the total token cost and rough USD cost. This enables:
+    - Logging for observability
+    - Warnings for expensive reviews
+    - Budget enforcement (skip review if over budget)
+
+    Uses ZERO LLM tokens — pure computation on file decisions.
+    """
+    file_decisions = state.get("file_decisions", [])
+    tier_str = state.get("review_tier", "standard")
+    file_groups = state.get("file_groups", [])
+    rule_groups = state.get("rule_groups", [])
+
+    # Determine number of groups for estimation
+    num_groups = len(file_groups) or len(rule_groups) or 1
+
+    # Determine rounds per group based on tier
+    if tier_str == ReviewTier.FAST:
+        rounds_per_group = 1  # FAST uses one-shot reviewer
+    elif tier_str == ReviewTier.DEEP:
+        rounds_per_group = 10
+    else:
+        rounds_per_group = 7
+
+    # Run estimation
+    estimate = estimate_review_cost(
+        file_decisions,
+        num_groups=num_groups,
+        rounds_per_group=rounds_per_group,
+    )
+
+    # Log the estimate banner
+    banner = format_estimate_banner(estimate)
+    logger.info(
+        "node.budget_estimation.completed",
+        banner=banner,
+        files=estimate.files,
+        groups=estimate.groups,
+        total_tokens=estimate.total_tokens,
+        estimated_cost_usd=estimate.estimated_cost_usd,
+        tier=tier_str,
+    )
+
+    # Check against budget limits
+    budget_result = check_budget(estimate)
+    if not budget_result.within_budget:
+        logger.warning(
+            "node.budget_estimation.over_budget",
+            action=budget_result.recommended_action,
+        )
+
+    # Store as dict for TypedDict compatibility
+    estimate_dict = {
+        "files": estimate.files,
+        "groups": estimate.groups,
+        "diff_tokens": estimate.diff_tokens,
+        "input_tokens": estimate.input_tokens,
+        "output_tokens": estimate.output_tokens,
+        "total_tokens": estimate.total_tokens,
+        "estimated_rounds": estimate.estimated_rounds,
+        "estimated_cost_usd": estimate.estimated_cost_usd,
+        "estimated_cost_description": estimate.estimated_cost_description,
+        "model": estimate.model,
+        "within_budget": budget_result.within_budget,
+    }
+
+    return {"review_estimate": estimate_dict}
+
+
+# ---------------------------------------------------------------------------
+# Agent Review node (Phase 3 — agentic tool-use loop)
+# ---------------------------------------------------------------------------
+
+async def agent_review_node(
+    state: ReviewState,
+    llm: QuotaAwareFallbackLLM,
+) -> dict:
+    """Agent review node — runs the agentic tool-use loop per rule group.
+
+    This is Phase 3 of the OCR migration. For STANDARD/DEEP tiers, it runs
+    an LLM agent with tools (code_comment, file_read, code_search, etc.)
+    for each rule group. The agent can read files, search the codebase,
+    and post findings with verbatim code snippets.
+
+    For FAST tier, falls back to the old one-shot reviewer for speed.
+
+    The findings from all groups are merged via the operator.add reducer
+    on the `findings` field in ReviewState.
+    """
+    diff_context = state["diff_context"]
+    tier_str = state.get("review_tier", "standard")
+    tier = ReviewTier(tier_str)
+    rule_groups = state.get("rule_groups", [])
+    pr_metadata = state.get("pr_metadata")
+
+    # FAST tier: use the old one-shot reviewer
+    if tier == ReviewTier.FAST or not rule_groups:
+        logger.info(
+            "node.agent_review.fast_path",
+            tier=tier_str,
+            reason="FAST tier or no rule groups",
+        )
+        try:
+            findings = await asyncio.wait_for(
+                run_reviewer(diff_context, llm, tier=tier, timeout=AGENT_TIMEOUT),
+                timeout=AGENT_TIMEOUT + 5,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("node.agent_review.fast_timeout")
+            return {"findings": [], "failed_agents": ["reviewer"]}
+        except Exception as e:
+            logger.error("node.agent_review.fast_error", error=str(e))
+            return {"findings": [], "failed_agents": ["reviewer"]}
+
+        return {"findings": findings or []}
+
+    # STANDARD/DEEP tier: run agent loop per rule group
+    all_findings: list[Finding] = []
+    failed_groups: list[str] = []
+
+    # Extract repo info for tool access
+    repo = pr_metadata.repo if pr_metadata else ""
+    head_sha = pr_metadata.head_sha if pr_metadata else ""
+    installation_id = pr_metadata.installation_id if pr_metadata else None
+
+    # Configure rounds based on tier
+    max_rounds = 7 if tier == ReviewTier.STANDARD else 10
+    budget_tokens = 50_000 if tier == ReviewTier.STANDARD else 80_000
+
+    for group in rule_groups:
+        if not group.files:
+            continue
+
+        try:
+            group_findings = await asyncio.wait_for(
+                review_group(
+                    rule_group=group,
+                    diff_context=diff_context,
+                    llm=llm,
+                    repo=repo,
+                    head_sha=head_sha,
+                    installation_id=installation_id,
+                    max_rounds=max_rounds,
+                    budget_tokens=budget_tokens,
+                    timeout=AGENT_TIMEOUT + 15,
+                ),
+                timeout=(AGENT_TIMEOUT + 15) * max_rounds,
+            )
+            all_findings.extend(group_findings)
+            logger.info(
+                "node.agent_review.group_done",
+                group_id=group.id,
+                pattern=group.pattern,
+                findings=len(group_findings),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "node.agent_review.group_timeout",
+                group_id=group.id,
+                pattern=group.pattern,
+            )
+            failed_groups.append(f"group_{group.id}_{group.pattern}")
+        except Exception as e:
+            logger.error(
+                "node.agent_review.group_error",
+                group_id=group.id,
+                pattern=group.pattern,
+                error=str(e),
+            )
+            failed_groups.append(f"group_{group.id}_{group.pattern}")
+
+    result: dict = {"findings": all_findings}
+    if failed_groups:
+        result["failed_agents"] = failed_groups
+
+    logger.info(
+        "node.agent_review.completed",
+        tier=tier_str,
+        total_groups=len(rule_groups),
+        total_findings=len(all_findings),
+        failed_groups=len(failed_groups),
+    )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Legacy reviewer node (kept for backward compatibility)
 # ---------------------------------------------------------------------------
 
 async def reviewer_node(
     state: ReviewState,
     llm: QuotaAwareFallbackLLM,
 ) -> dict:
-    """Unified reviewer node — single-pass review covering all categories.
+    """Legacy reviewer node — single-pass review covering all categories.
 
-    Replaces the old bug_agent, security_agent, style_agent, and test_agent
-    nodes. One LLM call instead of four. The diff is sent exactly once.
-
-    When file_selection has run, the diff_context already contains only
-    selected files — the reviewer never sees excluded files.
+    This is the old one-shot reviewer, kept as a fallback for FAST tier
+    and backward compatibility. For STANDARD/DEEP, use agent_review_node.
     """
     diff_context = state["diff_context"]
     tier_str = state.get("review_tier", "standard")
@@ -270,6 +582,23 @@ async def summarizer_node(
         "deep": "🔬",
     }.get(tier_str, "🔍")
     summary = f"> {tier_emoji} **Review tier: {tier_str}** — {triage_reason}\n\n{summary}"
+
+    # Add budget estimate banner if available (Phase 6)
+    review_estimate = state.get("review_estimate")
+    if review_estimate and review_estimate.get("total_tokens", 0) > 0:
+        cost_usd = review_estimate.get("estimated_cost_usd", 0)
+        if cost_usd < 0.001:
+            cost_str = "< $0.001"
+        elif cost_usd < 0.01:
+            cost_str = f"~${cost_usd:.4f}"
+        else:
+            cost_str = f"~${cost_usd:.3f}"
+        estimate_banner = (
+            f"💰 **Estimated cost:** "
+            f"~{review_estimate['total_tokens']:,} tokens, "
+            f"{cost_str}"
+        )
+        summary = f"> {estimate_banner}\n\n{summary}"
 
     # Add degraded mode banner if applicable
     if failed_agents:
