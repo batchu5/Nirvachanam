@@ -32,6 +32,7 @@ async def handle_push_webhook(
     repo: str,
     pr: int,
     sha: str,
+    installation_id: int | None = None,
 ) -> None:
     """Enqueue a debounced review job for a PR push event.
 
@@ -45,6 +46,7 @@ async def handle_push_webhook(
         repo: Repository full name (e.g. "owner/repo").
         pr: PR number.
         sha: HEAD commit SHA of the push.
+        installation_id: GitHub App installation ID, needed to authenticate as the App.
     """
     job_id = f"review:{repo}:{pr}"
     debounce_seconds = settings.review_debounce_seconds
@@ -72,6 +74,7 @@ async def handle_push_webhook(
         repo=repo,
         pr=pr,
         sha=sha,
+        installation_id=installation_id,
         _job_id=job_id,
         _defer_by=timedelta(seconds=debounce_seconds),
     )

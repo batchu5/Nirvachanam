@@ -7,7 +7,9 @@ Run with:
 import hashlib
 import hmac
 import json
+import os
 import sys
+from pathlib import Path
 
 import httpx
 
@@ -15,7 +17,11 @@ import httpx
 # Config
 # ---------------------------------------------------------------------------
 
-WEBHOOK_SECRET = "2d063722215e99aa60a33a1d1ed1112149d060c6"
+# Read the secret from .env / environment — never hard-code it.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.config import settings  # noqa: E402
+
+WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", settings.github_webhook_secret)
 API_URL = "http://localhost:8000"
 
 # Sample PR webhook payload (mimics what GitHub sends)

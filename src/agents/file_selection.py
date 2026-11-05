@@ -23,7 +23,6 @@ The selection pipeline applies filters in order:
 
 from __future__ import annotations
 
-import fnmatch
 import re
 from enum import StrEnum
 from dataclasses import dataclass
@@ -31,6 +30,7 @@ from dataclasses import dataclass
 import structlog
 
 from src.models.schemas import DiffContext, FileContext
+from src.skip_patterns import DEFAULT_SKIP_PATTERNS, first_matching_pattern
 
 logger = structlog.get_logger()
 
@@ -93,61 +93,7 @@ DEFAULT_ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
     ".md", ".rst", ".txt",
 })
 
-# Glob patterns for files that should never be reviewed
-DEFAULT_SKIP_PATTERNS: list[str] = [
-    # Lock files & minified assets
-    "*.lock",
-    "*.min.js",
-    "*.min.css",
-    "*.map",
-    # Generated code
-    "*.generated.*",
-    "*.pb.go",
-    "*_pb2.py",
-    "*_pb2_grpc.py",
-    # Vendor / dependency directories
-    "vendor/*",
-    "node_modules/*",
-    ".venv/*",
-    "venv/*",
-    # Snapshots & fixtures
-    "__snapshots__/*",
-    # Binary-like assets
-    "*.svg",
-    "*.png",
-    "*.jpg",
-    "*.jpeg",
-    "*.gif",
-    "*.ico",
-    "*.bmp",
-    "*.webp",
-    # Fonts
-    "*.woff",
-    "*.woff2",
-    "*.ttf",
-    "*.eot",
-    "*.otf",
-    # Compiled / cache
-    "*.pyc",
-    "__pycache__/*",
-    "*.class",
-    "*.o",
-    "*.so",
-    "*.dll",
-    "*.exe",
-    # Database migrations (often auto-generated)
-    "migrations/*.py",
-    # Package metadata
-    "package-lock.json",
-    "yarn.lock",
-    "pnpm-lock.yaml",
-    "Pipfile.lock",
-    "poetry.lock",
-    "Cargo.lock",
-    "go.sum",
-    "composer.lock",
-    "Gemfile.lock",
-]
+# Glob patterns for files that should never be reviewed (shared with the parser)
 
 # Markers in the first few lines of a file that indicate auto-generation
 GENERATED_MARKERS: tuple[str, ...] = (
@@ -207,10 +153,7 @@ def _matches_skip_pattern(
 
     Returns the matched pattern string, or None if no match.
     """
-    for pattern in skip_patterns:
-        if fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path.lower(), pattern):
-            return pattern
-    return None
+    return first_matching_pattern(path, skip_patterns)
 
 
 def _has_allowed_extension(

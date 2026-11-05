@@ -46,6 +46,7 @@ from src.agents.grouping import (
 )
 from src.agents.reviewer import run_reviewer
 from src.agents.triage import ReviewTier, triage_from_decisions, triage_pr
+from src.github.context import current_github_client
 from src.llm.fallback import QuotaAwareFallbackLLM
 from src.models.schemas import DiffContext, Finding, ReviewState, TokenUsage
 from src.rules.engine import group_by_rules, format_rules_summary, RuleGroup
@@ -391,6 +392,9 @@ async def agent_review_node(
     repo = pr_metadata.repo if pr_metadata else ""
     head_sha = pr_metadata.head_sha if pr_metadata else ""
     installation_id = pr_metadata.installation_id if pr_metadata else None
+    # Set by the worker; lets file_read / code_search hit the real repo
+    # instead of falling back to diff-only context.
+    github_client = current_github_client.get()
 
     # Configure rounds based on tier
     max_rounds = 7 if tier == ReviewTier.STANDARD else 10
@@ -408,6 +412,7 @@ async def agent_review_node(
                     llm=llm,
                     repo=repo,
                     head_sha=head_sha,
+                    github_client=github_client,
                     installation_id=installation_id,
                     max_rounds=max_rounds,
                     budget_tokens=budget_tokens,

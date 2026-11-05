@@ -1,0 +1,17 @@
+# Never bake secrets into the image
+.env
+.env.*
+!.env.example
+*.pem
+
+# Local / build artefacts
+.git
+.venv
+venv
+__pycache__
+*.pyc
+*.egg-info
+.pytest_cache
+.ruff_cache
+htmlcov
+.coverage

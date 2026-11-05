@@ -16,6 +16,7 @@ dependencies = [
     "asyncpg>=0.29.0",
     "structlog>=24.1.0",
     "python-dotenv>=1.0.0",
+    "tenacity>=8.2.0",
     # LLM providers
     "google-genai>=1.0.0",
     "groq>=0.9.0",
@@ -23,7 +24,12 @@ dependencies = [
     "langgraph>=0.4.0",
     "langgraph-checkpoint-postgres>=2.0.0",
     "psycopg[binary,pool]>=3.1.0",
+    # MCP server (exposes the reviewer as tools)
+    "mcp>=2.0.0",
 ]
+
+[project.scripts]
+nirvachanam-mcp = "src.mcp_server:main"
 
 [project.optional-dependencies]
 dev = [

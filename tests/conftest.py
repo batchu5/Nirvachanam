@@ -5,6 +5,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
+
+# Tests must not depend on the developer's real .env. Environment variables
+# take precedence over .env in pydantic-settings, so pin test values here
+# before anything imports src.config.
+os.environ["GITHUB_WEBHOOK_SECRET"] = "dev-secret"
+os.environ.setdefault("ENVIRONMENT", "test")
 
 import pytest
 
@@ -59,7 +66,7 @@ index 1234567..abcdefg 100644
      connection = get_db_connection()
      result = connection.execute(query)
  
-@@ -25,4 +27,5 @@ def logout(session_id: str) -> None:
+@@ -25,2 +27,3 @@ def logout(session_id: str) -> None:
      sessions.pop(session_id, None)
      logger.info(f"User logged out: {session_id}")
 +    # TODO: invalidate JWT token

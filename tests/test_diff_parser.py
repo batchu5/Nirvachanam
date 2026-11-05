@@ -1,6 +1,9 @@
 """Tests for unified diff parsing and file filtering."""
 
+import pytest
+
 from src.diff.parser import (
+    DiffParseError,
     build_diff_context,
     detect_language,
     parse_diff,
@@ -150,3 +153,36 @@ class TestBuildDiffContext:
 
         assert len(ctx.files) == 0
         assert ctx.total_additions == 0
+
+
+class TestSkipPatternsAnywhereInTree:
+    """Lockfiles and vendor dirs must be skipped even when nested."""
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "web/package-lock.json",
+            "apps/site/pnpm-lock.yaml",
+            "services/api/go.sum",
+            "frontend/yarn.lock",
+            "services/api/vendor/github.com/x/y.go",
+            "packages/ui/node_modules/react/index.js",
+            "Frontend/Package-Lock.json",
+        ],
+    )
+    def test_nested_paths_skipped(self, path):
+        assert should_skip_file(path) is True
+
+    @pytest.mark.parametrize("path", ["src/lock_manager.py", "docs/vendoring.md", "src/app.py"])
+    def test_similar_names_not_skipped(self, path):
+        assert should_skip_file(path) is False
+
+
+class TestParseErrors:
+    def test_malformed_diff_raises(self):
+        broken = (
+            "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n"
+            "@@ -1,5 +1,6 @@\n+only one line\n"
+        )
+        with pytest.raises(DiffParseError):
+            parse_diff(broken)

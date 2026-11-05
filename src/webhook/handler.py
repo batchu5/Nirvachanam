@@ -42,7 +42,7 @@ async def github_webhook(
     """
     # --- Filter to events we handle ---
     if x_github_event != "pull_request":
-        logger.debug("webhook.ignored_event", event=x_github_event)
+        logger.debug("webhook.ignored_event", github_event=x_github_event)
         return Response(status_code=202, content="Event ignored")
 
     # --- Parse payload ---
@@ -82,6 +82,7 @@ async def github_webhook(
         repo=pr_meta.repo,
         pr=pr_meta.pr_number,
         sha=pr_meta.head_sha,
+        installation_id=pr_meta.installation_id,
     )
 
     logger.info(

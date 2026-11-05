@@ -8,15 +8,18 @@ References: PRD §4b (file filtering), §5 (diff parsing), §10 (language detect
 
 from __future__ import annotations
 
-import fnmatch
-
 import structlog
 from unidiff import PatchSet
 
 from src.models.schemas import DiffContext, FileContext, HunkInfo, PRMetadata
 from src.security.redaction import redact_secrets
+from src.skip_patterns import DEFAULT_SKIP_PATTERNS, first_matching_pattern
 
 logger = structlog.get_logger()
+
+
+class DiffParseError(ValueError):
+    """Raised when a unified diff cannot be parsed."""
 
 # ---------------------------------------------------------------------------
 # §10 — Language detection by file extension
@@ -63,28 +66,7 @@ LANGUAGE_MAP: dict[str, str] = {
 # §4b — File patterns to always skip (configurable via .reviewrules.yaml)
 # ---------------------------------------------------------------------------
 
-DEFAULT_SKIP_PATTERNS: list[str] = [
-    "*.lock",
-    "*.min.js",
-    "*.min.css",
-    "*.map",
-    "*.generated.*",
-    "*.pb.go",
-    "*_pb2.py",
-    "vendor/*",
-    "node_modules/*",
-    "__snapshots__/*",
-    "*.svg",
-    "*.png",
-    "*.jpg",
-    "*.gif",
-    "*.ico",
-    "*.woff",
-    "*.woff2",
-    "*.ttf",
-    "*.eot",
-    "migrations/*.py",
-]
+# Single source of truth lives in src/skip_patterns.py
 
 
 def detect_language(filepath: str) -> str | None:
@@ -115,7 +97,7 @@ def should_skip_file(filepath: str, extra_skip_patterns: list[str] | None = None
         True if the file should be skipped.
     """
     patterns = DEFAULT_SKIP_PATTERNS + (extra_skip_patterns or [])
-    return any(fnmatch.fnmatch(filepath, pattern) for pattern in patterns)
+    return first_matching_pattern(filepath, patterns) is not None
 
 
 def parse_diff(
@@ -136,9 +118,11 @@ def parse_diff(
 
     try:
         patch_set = PatchSet(patch_text)
-    except Exception:
+    except Exception as exc:
+        # Don't silently turn a broken diff into "nothing to review" — the
+        # caller must know so it can report the failure on the PR.
         logger.exception("diff.parse_error")
-        return []
+        raise DiffParseError(f"Could not parse PR diff: {exc}") from exc
 
     files: list[FileContext] = []
 
