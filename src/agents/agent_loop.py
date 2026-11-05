@@ -39,7 +39,7 @@ from src.agents.tools.definitions import (
     find_tool,
 )
 from src.agents.tools.repair import repair_tool_call_args
-from src.llm.fallback import QuotaAwareFallbackLLM
+from src.llm.fallback import AllProvidersExhaustedError, QuotaAwareFallbackLLM
 from src.models.enums import Category, Severity
 from src.models.schemas import DiffContext, Finding
 from src.rules.engine import RuleGroup
@@ -290,10 +290,14 @@ async def run_agent_loop(
             temperature=0.2,
             max_tokens=4000,
             timeout=timeout,
+            tools=tool_schemas,
         )
 
         if response is None:
             logger.warning("agent_loop.llm_failed", round=round_num)
+            if round_num == 0:
+                # Never got a single answer — this group was not reviewed.
+                raise AllProvidersExhaustedError("No LLM provider returned a response")
             break
 
         total_tokens_used += response.tokens_used
@@ -407,6 +411,49 @@ async def run_agent_loop(
 # Tool call extraction from LLM response text
 # ---------------------------------------------------------------------------
 
+def _iter_json_objects(text: str):
+    """Yield every top-level JSON object embedded in free text.
+
+    Scans for ``{`` and lets ``json.JSONDecoder.raw_decode`` find the matching
+    end, so braces and quotes inside JSON strings are handled correctly.
+    """
+    decoder = json.JSONDecoder()
+    i = text.find("{")
+    while i != -1:
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            i = text.find("{", i + 1)
+            continue
+        yield obj
+        i = text.find("{", end)
+
+
+def _tool_calls_from_obj(obj: Any) -> list[dict[str, Any]]:
+    """Normalise the shapes LLMs use for tool calls into {name, arguments}."""
+    if isinstance(obj, list):
+        return [c for item in obj for c in _tool_calls_from_obj(item)]
+    if not isinstance(obj, dict):
+        return []
+    if "tool_calls" in obj and isinstance(obj["tool_calls"], list):
+        return _tool_calls_from_obj(obj["tool_calls"])
+    if "function_call" in obj and isinstance(obj["function_call"], dict):
+        call = obj["function_call"]
+        args = call.get("args", call.get("arguments", {}))
+        return [{"name": call.get("name", ""), "arguments": args}]
+    if "function" in obj and isinstance(obj["function"], dict):
+        return _tool_calls_from_obj(obj["function"])
+    if isinstance(obj.get("name"), str) and "arguments" in obj:
+        args = obj["arguments"]
+        if isinstance(args, str):  # OpenAI-style: arguments as a JSON string
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                pass
+        return [{"name": obj["name"], "arguments": args}]
+    return []
+
+
 def _extract_tool_calls_from_response(
     response_text: str,
 ) -> list[dict[str, Any]]:
@@ -421,28 +468,26 @@ def _extract_tool_calls_from_response(
     """
     tool_calls: list[dict[str, Any]] = []
 
-    # Pattern 1: JSON objects with "name" and "arguments" fields
-    json_pattern = r'\{[^{}]*"name"\s*:\s*"(\w+)"[^{}]*"arguments"\s*:\s*(\{[^{}]*\})[^{}]*\}'
-    for match in re.finditer(json_pattern, response_text, re.DOTALL):
-        name = match.group(1)
-        try:
-            args = json.loads(match.group(2))
-            tool_calls.append({"name": name, "arguments": args})
-        except json.JSONDecodeError:
-            tool_calls.append({"name": name, "arguments": match.group(2)})
+    # Pattern 1: JSON objects with "name" and "arguments" fields.
+    # Uses a real JSON decoder rather than a regex: review comments quote
+    # code, and code is full of braces (f-strings, dicts, JS/Java/Go blocks).
+    # A `[^{}]*` regex silently dropped every such tool call.
+    for obj in _iter_json_objects(response_text):
+        tool_calls.extend(_tool_calls_from_obj(obj))
 
     if tool_calls:
         return tool_calls
 
     # Pattern 2: Function-call-like syntax: tool_name({...})
-    func_pattern = r'(code_comment|file_read|file_read_diff|code_search|task_done)\s*\((\{.*?\})\)'
-    for match in re.finditer(func_pattern, response_text, re.DOTALL):
-        name = match.group(1)
+    func_pattern = r'(code_comment|file_read|file_read_diff|code_search|task_done)\s*\(\s*(?=\{)'
+    decoder = json.JSONDecoder()
+    for match in re.finditer(func_pattern, response_text):
         try:
-            args = json.loads(match.group(2))
-            tool_calls.append({"name": name, "arguments": args})
+            args, _ = decoder.raw_decode(response_text, match.end())
         except json.JSONDecodeError:
-            tool_calls.append({"name": name, "arguments": match.group(2)})
+            continue
+        if isinstance(args, dict):
+            tool_calls.append({"name": match.group(1), "arguments": args})
 
     if tool_calls:
         return tool_calls

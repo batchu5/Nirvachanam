@@ -176,14 +176,37 @@ class GeminiProvider:
         )
 
 
+def _loads_or_raw(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return text
+
+
+def _recover_failed_tool_generation(error: Exception) -> str | None:
+    """Groq rejects a reply with ``tool_use_failed`` when the model emits a tool
+    call it wasn't offered, but includes the generation in the error body. That
+    text is a perfectly good tool call for our parser, so use it."""
+    body = getattr(error, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error", body)
+        if isinstance(err, dict) and err.get("code") == "tool_use_failed":
+            gen = err.get("failed_generation")
+            if isinstance(gen, str) and gen.strip():
+                return gen
+    return None
+
+
 class GroqProvider:
+    supports_native_tools = True
+
     """Groq provider using the official groq SDK.
 
     Uses function/tool calling for structured output.
     """
 
-    def __init__(self, api_key: str, model: str = "llama-3.3-70b-versatile"):
-        
+    def __init__(self, api_key: str, model: str = "openai/gpt-oss-120b"):
+
 
         self._client = AsyncGroq(api_key=api_key)
         self._model = model
@@ -198,6 +221,7 @@ class GroqProvider:
         response_schema: type[BaseModel] | dict[str, Any] | None = None,
         temperature: float = 0.2,
         max_tokens: int = 2000,
+        tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         """Call Groq with optional structured output via JSON mode.
 
@@ -221,9 +245,17 @@ class GroqProvider:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        # gpt-oss models are reasoning models: keep reasoning short so the
+        # output budget goes to the actual answer (tool calls / JSON).
+        if self._model.startswith("openai/gpt-oss"):
+            kwargs["reasoning_effort"] = "low"
+
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
 
         # Groq supports JSON mode — inject schema into system prompt
-        if resolved_schema is not None:
+        if resolved_schema is not None and not tools:
             kwargs["response_format"] = {"type": "json_object"}
             # Prepend schema instruction to system message
             schema_instruction = (
@@ -240,12 +272,29 @@ class GroqProvider:
                 messages.insert(0, {"role": "system", "content": schema_instruction})
             kwargs["messages"] = messages
 
-        response = await self._client.chat.completions.create(**kwargs)
+        try:
+            response = await self._client.chat.completions.create(**kwargs)
+        except Exception as e:
+            recovered = _recover_failed_tool_generation(e)
+            if recovered is None:
+                raise
+            logger.info("llm.groq.recovered_tool_generation", model=self._model)
+            return LLMResponse(
+                content=recovered, tokens_used=0, input_tokens=0, output_tokens=0,
+                model=self._model, provider="groq",
+            )
 
-        # Extract content and tokens
+        # Extract content and tokens. Native tool calls are serialised into the
+        # same JSON text shape the agent loop already parses.
         content_text = ""
-        if response.choices and response.choices[0].message.content:
-            content_text = response.choices[0].message.content
+        message = response.choices[0].message if response.choices else None
+        if message is not None and getattr(message, "tool_calls", None):
+            content_text = json.dumps({"tool_calls": [
+                {"name": tc.function.name, "arguments": _loads_or_raw(tc.function.arguments)}
+                for tc in message.tool_calls
+            ]})
+        elif message is not None and message.content:
+            content_text = message.content
 
         input_tokens = response.usage.prompt_tokens if response.usage else 0
         output_tokens = response.usage.completion_tokens if response.usage else 0

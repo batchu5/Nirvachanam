@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
+from arq import Retry
 
 from src.config import settings
 from src.diff.parser import DiffParseError, build_diff_context
@@ -32,6 +33,9 @@ from src.queue.debounce import check_already_reviewed, mark_as_reviewed
 from src.queue.redis_pool import get_redis_settings
 
 logger = structlog.get_logger()
+
+# Back-off before re-trying a review whose LLM calls all failed.
+RETRY_DELAY_SECONDS = 120
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +155,25 @@ async def run_review(
     finally:
         current_github_client.reset(token)
 
-    # 5. Post a single review with inline comments
+    # 5. Nothing was actually reviewed (LLMs down / timed out): don't post a
+    #    review that reads as "all clear". Retry later; give up visibly.
+    if result["failed_agents"] and not result["verified_findings"]:
+        job_try = ctx.get("job_try", 1)
+        if job_try < WorkerSettings.max_tries:
+            log.warning("worker.run_review.incomplete_retrying", job_try=job_try)
+            raise Retry(defer=RETRY_DELAY_SECONDS * job_try)
+        log.error("worker.run_review.incomplete_giving_up", failed=result["failed_agents"])
+        await github.post_comment(
+            repo,
+            pr,
+            "⚠️ **AI review could not be completed:** the LLM providers were unavailable "
+            f"after {job_try} attempts. Push another commit to retry.",
+            installation_id=installation_id,
+        )
+        await mark_as_reviewed(redis, repo, pr, sha)
+        return {"status": "failed", "reason": "llm_unavailable"}
+
+    # 6. Post a single review with inline comments
     findings = result["verified_findings"][: settings.max_comments_per_review]
     comments = build_review_comments(findings, diff_context)
     body = build_review_body(

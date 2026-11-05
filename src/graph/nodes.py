@@ -46,6 +46,7 @@ from src.agents.grouping import (
 )
 from src.agents.reviewer import run_reviewer
 from src.agents.triage import ReviewTier, triage_from_decisions, triage_pr
+from src.config import settings
 from src.github.context import current_github_client
 from src.llm.fallback import QuotaAwareFallbackLLM
 from src.models.schemas import DiffContext, Finding, ReviewState, TokenUsage
@@ -54,7 +55,7 @@ from src.rules.engine import group_by_rules, format_rules_summary, RuleGroup
 logger = structlog.get_logger()
 
 # Hard timeout per agent (§11)
-AGENT_TIMEOUT = 30
+AGENT_TIMEOUT = settings.agent_timeout  # per LLM call, seconds
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +565,9 @@ async def summarizer_node(
     tier_str = state.get("review_tier", "standard")
     file_decisions = state.get("file_decisions")
 
-    summary = _generate_summary(verified_findings, diff_context, tier_str)
+    summary = _generate_summary(
+        verified_findings, diff_context, tier_str, incomplete=bool(failed_agents)
+    )
 
     # Add file selection info if available
     if file_decisions:
@@ -608,7 +611,7 @@ async def summarizer_node(
     if failed_agents:
         banner = (
             f"⚠️ Review completed in degraded mode — "
-            f"{', '.join(failed_agents)} timed out. Results may be incomplete."
+            f"{', '.join(failed_agents)} failed or timed out. Results may be incomplete."
         )
         summary = f"> {banner}\n\n{summary}"
 
@@ -619,11 +622,20 @@ def _generate_summary(
     findings: list[Finding],
     diff_context: DiffContext,
     tier: str,
+    incomplete: bool = False,
 ) -> str:
     """Generate a template-based summary — zero LLM tokens.
 
     This replaces the LLM-based summarizer entirely.
     """
+    if not findings and incomplete:
+        return (
+            "## 🔍 AI Code Review Summary\n\n"
+            "**Overall Assessment:** ⚠️ Review could not be completed — the LLM "
+            "provider(s) were unavailable, so this is **not** a clean bill of health.\n\n"
+            f"Analyzed {len(diff_context.files)} files "
+            f"(+{diff_context.total_additions} -{diff_context.total_deletions} lines)."
+        )
     if not findings:
         return (
             "## 🔍 AI Code Review Summary\n\n"

@@ -19,7 +19,7 @@ import structlog
 from pydantic import ValidationError
 
 from src.agents.triage import ReviewTier
-from src.llm.fallback import QuotaAwareFallbackLLM
+from src.llm.fallback import AllProvidersExhaustedError, QuotaAwareFallbackLLM
 from src.models.agent_io import ReviewerOutput, AgentFinding
 from src.models.schemas import DiffContext, Finding
 from src.models.enums import Category
@@ -180,8 +180,9 @@ async def run_reviewer(
     )
 
     if response is None:
+        # Returning [] here would be reported as "no issues found".
         logger.warning("reviewer.all_providers_failed")
-        return []
+        raise AllProvidersExhaustedError("No LLM provider returned a response")
 
     # Parse and validate
     try:

@@ -141,3 +141,31 @@ def test_build_llm_requires_a_provider(monkeypatch):
     monkeypatch.setattr(worker.settings, "groq_api_key", "")
     with pytest.raises(RuntimeError, match="No LLM provider"):
         worker.build_llm(AsyncMock())
+
+
+_FAILED_RESULT = {
+    "summary": "x",
+    "verified_findings": [],
+    "failed_agents": ["reviewer"],
+    "review_tier": "standard",
+}
+
+
+async def test_llm_outage_retries_instead_of_posting_clean_review(ctx, github, not_reviewed_yet):
+    from arq import Retry
+
+    ctx["job_try"] = 1
+    with patch.object(worker, "run_review_pipeline", AsyncMock(return_value=_FAILED_RESULT)):
+        with pytest.raises(Retry):
+            await worker.run_review(ctx, REPO, PR, SHA)
+    github.post_review.assert_not_awaited()
+    not_reviewed_yet.assert_not_awaited()
+
+
+async def test_llm_outage_on_last_try_posts_visible_failure(ctx, github, not_reviewed_yet):
+    ctx["job_try"] = worker.WorkerSettings.max_tries
+    with patch.object(worker, "run_review_pipeline", AsyncMock(return_value=_FAILED_RESULT)):
+        result = await worker.run_review(ctx, REPO, PR, SHA)
+    assert result["reason"] == "llm_unavailable"
+    github.post_review.assert_not_awaited()
+    assert "could not be completed" in github.post_comment.call_args.args[2]

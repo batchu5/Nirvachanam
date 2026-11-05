@@ -41,6 +41,10 @@ class SchemaValidationError(Exception):
     """LLM response failed pydantic validation after repair retry."""
 
 
+class EmptyResponseError(Exception):
+    """Provider returned a response with no content — treated as transient."""
+
+
 class AllProvidersExhaustedError(Exception):
     """All providers failed or are exhausted."""
 
@@ -106,9 +110,13 @@ class QuotaAwareFallbackLLM:
         self,
         providers: list[LLMProvider],
         quota: ProviderQuotaTracker,
+        max_passes: int = 2,
+        retry_backoff_seconds: float = 2.0,
     ):
         self.providers = providers
         self.quota = quota
+        self.max_passes = max_passes
+        self.retry_backoff_seconds = retry_backoff_seconds
 
     async def invoke(
         self,
@@ -117,6 +125,7 @@ class QuotaAwareFallbackLLM:
         temperature: float = 0.2,
         max_tokens: int = 2000,
         timeout: int = 30,
+        tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse | None:
         """Call the first available provider, with fallback on failure.
 
@@ -133,100 +142,115 @@ class QuotaAwareFallbackLLM:
         """
         last_error: Exception | None = None
 
-        for provider in self.providers:
-            # Proactive check 1: exhaustion flag
-            if await self.quota.is_exhausted(provider.name):
-                logger.info(
-                    "fallback.skipping_exhausted",
-                    provider=provider.name,
-                )
-                continue
+        # Two passes over the chain: transient failures (503s, timeouts, empty
+        # replies) are common and usually clear up on an immediate retry.
+        for attempt in range(self.max_passes):
+            if attempt:
+                logger.info("fallback.retry_pass", attempt=attempt + 1)
+                await asyncio.sleep(self.retry_backoff_seconds)
+            for provider in self.providers:
+                # Proactive check 1: exhaustion flag
+                if await self.quota.is_exhausted(provider.name):
+                    logger.info(
+                        "fallback.skipping_exhausted",
+                        provider=provider.name,
+                    )
+                    continue
 
-            # Proactive check 2: near quota limit
-            if not await self.quota.can_call(provider.name):
-                logger.info(
-                    "fallback.skipping_near_limit",
-                    provider=provider.name,
-                )
-                continue
+                # Proactive check 2: near quota limit
+                if not await self.quota.can_call(provider.name):
+                    logger.info(
+                        "fallback.skipping_near_limit",
+                        provider=provider.name,
+                    )
+                    continue
 
-            try:
-                response = await asyncio.wait_for(
-                    provider.invoke(
-                        messages=messages,
-                        response_schema=response_schema,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    ),
-                    timeout=timeout,
-                )
-                # Record successful call
-                await self.quota.record_call(provider.name, response.tokens_used)
-                return response
+                try:
+                    call_kwargs: dict[str, Any] = {
+                        "messages": messages,
+                        "response_schema": response_schema,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    }
+                    # Native function calling where the provider supports it;
+                    # tools are also described in the prompt for those that don't.
+                    if tools and getattr(provider, "supports_native_tools", False):
+                        call_kwargs["tools"] = tools
+                    response = await asyncio.wait_for(
+                        provider.invoke(**call_kwargs),
+                        timeout=timeout,
+                    )
+                    # Reasoning models occasionally put everything in their hidden
+                    # reasoning and return empty content. That is not an answer.
+                    if not (response.content or "").strip():
+                        raise EmptyResponseError(f"{provider.name} returned empty content")
+                    # Record successful call
+                    await self.quota.record_call(provider.name, response.tokens_used)
+                    return response
 
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "fallback.timeout",
-                    provider=provider.name,
-                    timeout=timeout,
-                )
-                last_error = asyncio.TimeoutError(
-                    f"{provider.name} timed out after {timeout}s"
-                )
-                continue
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "fallback.timeout",
+                        provider=provider.name,
+                        timeout=timeout,
+                    )
+                    last_error = asyncio.TimeoutError(
+                        f"{provider.name} timed out after {timeout}s"
+                    )
+                    continue
 
-            except Exception as e:
-                error_type, retry_after = _classify_provider_error(e)
+                except Exception as e:
+                    error_type, retry_after = _classify_provider_error(e)
 
-                if error_type == "rate_limit":
-                    if retry_after and retry_after > 60:
-                        # Quota exhaustion — mark and skip
-                        await self.quota.record_exhaustion(
-                            provider.name, retry_after
-                        )
-                        logger.warning(
-                            "fallback.quota_exhaustion",
+                    if error_type == "rate_limit":
+                        if retry_after and retry_after > 60:
+                            # Quota exhaustion — mark and skip
+                            await self.quota.record_exhaustion(
+                                provider.name, retry_after
+                            )
+                            logger.warning(
+                                "fallback.quota_exhaustion",
+                                provider=provider.name,
+                                retry_after=retry_after,
+                            )
+                            continue
+                        else:
+                            # Transient 429 — brief backoff, then fallback
+                            wait = min(retry_after or 5, 10)
+                            logger.info(
+                                "fallback.transient_rate_limit",
+                                provider=provider.name,
+                                wait=wait,
+                            )
+                            await asyncio.sleep(wait)
+                            last_error = e
+                            continue
+
+                    elif error_type == "auth":
+                        logger.error(
+                            "fallback.auth_error",
                             provider=provider.name,
-                            retry_after=retry_after,
+                            error=str(e),
                         )
-                        continue
-                    else:
-                        # Transient 429 — brief backoff, then fallback
-                        wait = min(retry_after or 5, 10)
-                        logger.info(
-                            "fallback.transient_rate_limit",
+                        raise AuthError(f"Auth error on {provider.name}: {e}") from e
+
+                    elif error_type == "hard":
+                        logger.error(
+                            "fallback.hard_error",
                             provider=provider.name,
-                            wait=wait,
+                            error=str(e),
                         )
-                        await asyncio.sleep(wait)
                         last_error = e
                         continue
 
-                elif error_type == "auth":
-                    logger.error(
-                        "fallback.auth_error",
-                        provider=provider.name,
-                        error=str(e),
-                    )
-                    raise AuthError(f"Auth error on {provider.name}: {e}") from e
-
-                elif error_type == "hard":
-                    logger.error(
-                        "fallback.hard_error",
-                        provider=provider.name,
-                        error=str(e),
-                    )
-                    last_error = e
-                    continue
-
-                else:  # transient
-                    logger.warning(
-                        "fallback.transient_error",
-                        provider=provider.name,
-                        error=str(e),
-                    )
-                    last_error = e
-                    continue
+                    else:  # transient
+                        logger.warning(
+                            "fallback.transient_error",
+                            provider=provider.name,
+                            error=str(e),
+                        )
+                        last_error = e
+                        continue
 
         # All providers failed
         if last_error:

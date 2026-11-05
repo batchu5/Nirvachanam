@@ -162,6 +162,7 @@ class ReviewState(TypedDict, total=False):
     """
     diff_context: DiffContext
     file_decisions: list     # list[FileDecision] — set by file_selection node
+    rule_groups: list        # list[RuleGroup] — set by rule_grouping node; drives the agent loop
     active_agents: list[str]
     findings: Annotated[list[Finding], operator.add]
     verified_findings: list[Finding]
