@@ -42,6 +42,13 @@ from src.graph.nodes import (
     triage_node,
 )
 from src.llm.fallback import QuotaAwareFallbackLLM
+from src.graph.run_identity import (
+    compute_run_identity_from_decisions,
+    check_previous_run,
+    mark_identity_completed,
+    format_run_identity,
+    format_skip_message,
+)
 from src.models.schemas import DiffContext, PRMetadata, ReviewState
 
 logger = structlog.get_logger()
@@ -181,12 +188,33 @@ async def run_review_pipeline(
         "triage_reason": "",
     }
 
+    # Step 2b: Compute run identity and check for previous runs (Phase 7)
+    # Run file selection first (deterministic, zero LLM) so we can compute
+    # the identity from the selected files.
+    from src.agents.file_selection import select_files, selected_files as get_selected_files
+    file_decisions = select_files(processed_diff)
+    initial_state["file_decisions"] = file_decisions
+
+    run_identity = compute_run_identity_from_decisions(
+        file_decisions,
+        head_sha=pr_metadata.head_sha,
+        base_sha=pr_metadata.base_sha,
+    )
+
+    logger.info(
+        "pipeline.run_identity",
+        identity=format_run_identity(run_identity),
+    )
+
+    # Use identity hash as thread_id for LangGraph checkpoint resume
+    effective_thread_id = thread_id or run_identity.as_thread_id()
+
     # Step 3: Build and run graph
     graph = build_review_graph(llm, checkpointer)
 
     config: dict[str, Any] = {}
-    if thread_id:
-        config["configurable"] = {"thread_id": thread_id}
+    if effective_thread_id:
+        config["configurable"] = {"thread_id": effective_thread_id}
 
     # Run the graph
     result = await graph.ainvoke(initial_state, config=config)
@@ -222,4 +250,5 @@ async def run_review_pipeline(
         "failed_agents": failed_agents,
         "large_pr_message": large_pr_message,
         "review_tier": review_tier,
+        "run_identity": run_identity.short_hash,
     }

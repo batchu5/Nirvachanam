@@ -570,7 +570,7 @@ def _extract_inline_findings(
 
 
 # ---------------------------------------------------------------------------
-# Convert RawComments to Findings (with line resolution)
+# Convert RawComments to Findings (with line resolution — Phase 4)
 # ---------------------------------------------------------------------------
 
 def raw_comments_to_findings(
@@ -579,8 +579,8 @@ def raw_comments_to_findings(
 ) -> list[Finding]:
     """Convert RawComment objects to Finding objects.
 
-    Resolves line numbers from the verbatim code snippets in each comment.
-    Uses the code-snippet-based resolution approach from OCR.
+    Resolves line numbers from the verbatim code snippets in each comment
+    using the deterministic resolver from Phase 4 (src/diff/resolver.py).
 
     Args:
         comments: List of RawComment from the agent loop.
@@ -589,6 +589,8 @@ def raw_comments_to_findings(
     Returns:
         List of Finding objects with resolved line numbers.
     """
+    from src.diff.resolver import resolve_line_numbers
+
     findings: list[Finding] = []
 
     # Category string → Category enum mapping
@@ -599,24 +601,19 @@ def raw_comments_to_findings(
         "test": Category.TEST,
     }
 
-    for comment in comments:
-        # Resolve line number from code snippet
-        line = _resolve_line_from_snippet(
-            comment.file, comment.existing_code, diff_context
-        )
+    # Resolve all line numbers via the Phase 4 resolver
+    resolutions = resolve_line_numbers(comments, diff_context)
 
-        if line is None:
-            # Fallback: try to find any line in the file's diff
-            line = _fallback_line_resolution(comment.file, diff_context)
-
-        if line is None:
-            line = 1  # Last resort default
+    for comment, resolution in resolutions:
+        # Use resolved file (may differ from comment.file after relocation)
+        resolved_file = resolution.file or comment.file
 
         category = category_map.get(comment.category.lower(), Category.BUG)
 
         findings.append(Finding(
-            file=comment.file,
-            line=line,
+            file=resolved_file,
+            line=resolution.line,
+            end_line=resolution.end_line,
             severity=Severity(comment.severity) if comment.severity in ("info", "warning", "critical") else Severity.WARNING,
             category=category,
             message=comment.message,
