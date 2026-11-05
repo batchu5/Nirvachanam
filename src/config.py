@@ -39,7 +39,7 @@ class Settings(BaseSettings):
 
     # --- LLM Providers ---
     gemini_api_key: str = Field(default="", description="Google Gemini AI Studio API key")
-    gemini_model: str = Field(default="gemini-2.5-flash", description="Gemini model name")
+    gemini_model: str = Field(default="gemini-3.8-flash", description="Gemini model name")
     groq_api_key: str = Field(default="", description="Groq API key")
     groq_model: str = Field(default="llama-3.3-70b-versatile", description="Groq model name")
 
